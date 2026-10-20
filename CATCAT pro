@@ -1,0 +1,447 @@
+import sys
+import os
+import subprocess
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QTextEdit, QComboBox, QFileDialog,
+    QSplitter, QListWidget, QMessageBox, QTabWidget, QGroupBox, QSlider
+)
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+
+# Import thư viện hỗ trợ xử lý
+try:
+    import yt_dlp
+    from gtts import gTTS
+    from googletrans import Translator
+except ImportError:
+    pass
+
+# ---------------------------------------------------------------------------
+# Workers (Xử lý bất đồng bộ đa luồng mượt mà)
+# ---------------------------------------------------------------------------
+
+class DownloadThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            os.makedirs("downloads", exist_ok=True)
+            ydl_opts = {
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'outtmpl': 'downloads/%(title)s.%(ext)s',
+                'quiet': True
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=True)
+                filename = ydl.prepare_filename(info)
+                self.finished.emit(filename)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class AIReviewVoiceThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, text, lang, voice_style):
+        super().__init__()
+        self.text = text
+        self.lang = lang
+        self.voice_style = voice_style  # Kiểu giọng đọc review/thuyết minh
+
+    def run(self):
+        try:
+            # Tùy biến tốc độ hoặc âm điệu dựa trên phong cách review
+            slow = True if "Trầm ấm / Kể chuyện" in self.voice_style else False
+            tts = gTTS(text=self.text, lang=self.lang, slow=slow)
+            output_path = "temp_ai_review.mp3"
+            tts.save(output_path)
+            self.finished.emit(output_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class TranslationThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, text, dest_lang):
+        super().__init__()
+        self.text = text
+        self.dest_lang = dest_lang
+
+    def run(self):
+        try:
+            translator = Translator()
+            res = translator.translate(self.text, dest=self.dest_lang)
+            self.finished.emit(res.text)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class FFmpegProcessThread(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, input_video, audio_track, start_time, duration, speed_mode, filter_mode, output_path):
+        super().__init__()
+        self.input_video = input_video
+        self.audio_track = audio_track
+        self.start_time = start_time
+        self.duration = duration
+        self.speed_mode = speed_mode
+        self.filter_mode = filter_mode
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            cmd = ['ffmpeg', '-y']
+            if self.start_time:
+                cmd.extend(['-ss', str(self.start_time)])
+            if self.duration:
+                cmd.extend(['-t', str(self.duration)])
+
+            cmd.extend(['-i', self.input_video])
+
+            if self.audio_track and os.path.exists(self.audio_track):
+                cmd.extend(['-i', self.audio_track])
+
+            # Xử lý hiệu ứng video & tốc độ (Filters)
+            video_filters = []
+            if "Đen trắng (Grayscale)" in self.filter_mode:
+                video_filters.append("format=gray")
+            elif "Tăng sáng (Brightness)" in self.filter_mode:
+                video_filters.append("eq=brightness=0.1")
+
+            if "Tua nhanh 2x" in self.speed_mode:
+                video_filters.append("setpts=0.5*PTS")
+            elif "Chậm 0.5x (Slow-mo)" in self.speed_mode:
+                video_filters.append("setpts=2.0*PTS")
+
+            if video_filters:
+                cmd.extend(['-vf', ','.join(video_filters)])
+
+            # Mapping audio và video
+            if self.audio_track and os.path.exists(self.audio_track):
+                cmd.extend(['-c:v', 'libx264', '-c:a', 'aac', '-map', '0:v:0', '-map', '1:a:0'])
+            else:
+                cmd.extend(['-c:v', 'libx264', '-c:a', 'aac'])
+
+            cmd.append(self.output_path)
+
+            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if process.returncode == 0:
+                self.finished.emit(self.output_path)
+            else:
+                self.error.emit(process.stderr.decode('utf-8'))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Giao Diện CATCAT Pro UI
+# ---------------------------------------------------------------------------
+
+class CatCatProApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🐈 CATCAT Pro - AI Video Editor & Review Studio")
+        self.resize(1300, 800)
+        self.current_video_path = ""
+        self.current_audio_path = ""
+
+        self.init_ui()
+        self.apply_pro_theme()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # ---------------- BẢNG ĐIỀU KHIỂN BÊN TRÁI (TÍCH HỢP TOÀN BỘ TÍNH NĂNG AI) ----------------
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+
+        tab_widget = QTabWidget()
+        left_layout.addWidget(tab_widget)
+
+        # Tab 1: Media & Tải Video
+        media_tab = QWidget()
+        m_layout = QVBoxLayout(media_tab)
+
+        btn_browse = QPushButton("📁 Nhập Video/Audio Từ Máy Tính")
+        btn_browse.clicked.connect(self.browse_media)
+        m_layout.addWidget(btn_browse)
+
+        dl_group = QGroupBox("📥 Tải Video Online (YouTube, TikTok, Facebook...)")
+        dl_layout = QVBoxLayout(dl_group)
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Dán liên kết video vào đây...")
+        dl_layout.addWidget(self.url_input)
+        btn_dl = QPushButton("Tải Xuống Ngay")
+        btn_dl.clicked.connect(self.download_video)
+        dl_layout.addWidget(btn_dl)
+        m_layout.addWidget(dl_group)
+
+        m_layout.addWidget(QLabel("Danh sách Media trong dự án:"))
+        self.media_list = QListWidget()
+        self.media_list.itemDoubleClicked.connect(self.select_media)
+        m_layout.addWidget(self.media_list)
+        tab_widget.addTab(media_tab, "1. Media & Tải")
+
+        # Tab 2: Giọng Đọc AI Review & Thuyết Minh
+        ai_voice_tab = QWidget()
+        ai_layout = QVBoxLayout(ai_voice_tab)
+
+        ai_layout.addWidget(QLabel("Nhập kịch bản Review / Thuyết minh:"))
+        self.ai_text = QTextEdit()
+        self.ai_text.setPlaceholderText("Nhập nội dung để AI đọc lồng tiếng cho video...")
+        ai_layout.addWidget(self.ai_text)
+
+        ai_layout.addWidget(QLabel("Chọn phong cách giọng đọc Review:"))
+        self.voice_style_combo = QComboBox()
+        self.voice_style_combo.addItems([
+            "🎙️ Giọng Review Phim / Top Trending (Nhanh, cuốn hút)",
+            "🎧 Trầm ấm / Kể chuyện (Storytelling chậm rãi)",
+            "📢 Giọng Quảng Cáo / Bán Hàng (Năng lượng cao)",
+            "🤖 Giọng Tiêu Chuẩn (Mặc định)"
+        ])
+        ai_layout.addWidget(self.voice_style_combo)
+
+        ai_layout.addWidget(QLabel("Ngôn ngữ giọng đọc:"))
+        self.ai_lang_combo = QComboBox()
+        self.ai_lang_combo.addItems(["Tiếng Việt (vi)", "Tiếng Anh (en)", "Tiếng Trung (zh-CN)", "Tiếng Nhật (ja)", "Tiếng Hàn (ko)"])
+        ai_layout.addWidget(self.ai_lang_combo)
+
+        btn_gen_voice = QPushButton("🗣️ Tạo & Lồng Giọng Đọc AI Vào Video")
+        btn_gen_voice.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
+        btn_gen_voice.clicked.connect(self.generate_ai_voice)
+        ai_layout.addWidget(btn_gen_voice)
+        tab_widget.addTab(ai_voice_tab, "2. AI Review Voices")
+
+        # Tab 3: Dịch Đa Ngôn Ngữ Tự Động
+        trans_tab = QWidget()
+        t_layout = QVBoxLayout(trans_tab)
+
+        t_layout.addWidget(QLabel("Văn bản gốc / Phụ đề:"))
+        self.trans_src = QTextEdit()
+        t_layout.addWidget(self.trans_src)
+
+        t_layout.addWidget(QLabel("Dịch sang ngôn ngữ:"))
+        self.trans_dest_combo = QComboBox()
+        self.trans_dest_combo.addItems(["Tiếng Anh (en)", "Tiếng Việt (vi)", "Tiếng Trung (zh-CN)", "Tiếng Nhật (ja)", "Tiếng Tây Ban Nha (es)"])
+        t_layout.addWidget(self.trans_dest_combo)
+
+        btn_trans = QPushButton("🌍 Dịch Phụ Đề & Văn Bản Tự Động")
+        btn_trans.clicked.connect(self.translate_content)
+        t_layout.addWidget(btn_trans)
+
+        t_layout.addWidget(QLabel("Kết quả dịch:"))
+        self.trans_out = QTextEdit()
+        self.trans_out.setReadOnly(True)
+        t_layout.addWidget(self.trans_out)
+        tab_widget.addTab(trans_tab, "3. Dịch Đa Ngôn Ngữ")
+
+        # Tab 4: Hiệu Ứng & Tốc Độ (FX & Speed)
+        fx_tab = QWidget()
+        fx_layout = QVBoxLayout(fx_tab)
+
+        fx_layout.addWidget(QLabel("Hiệu ứng màu sắc video (Filters):"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["Bình thường (Normal)", "Đen trắng (Grayscale)", "Tăng sáng (Brightness)"])
+        fx_layout.addWidget(self.filter_combo)
+
+        fx_layout.addWidget(QLabel("Tốc độ phát video (Speed Control):"))
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["Bình thường (1.0x)", "Tua nhanh 2x", "Chậm 0.5x (Slow-mo)"])
+        fx_layout.addWidget(self.speed_combo)
+
+        tab_widget.addTab(fx_tab, "4. Hiệu Ứng & Tốc Độ")
+
+        splitter.addWidget(left_panel)
+
+        # ---------------- TRÌNH XEM & XUẤT VIDEO BÊN PHẢI ----------------
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        # Trình phát video (Video Player)
+        self.video_widget = QVideoWidget()
+        self.media_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.setVideoOutput(self.video_widget)
+        right_layout.addWidget(self.video_widget, stretch=4)
+
+        # Điều khiển phát
+        ctrl_layout = QHBoxLayout()
+        self.btn_play = QPushButton("▶ Play / Pause")
+        self.btn_play.clicked.connect(self.toggle_play)
+        ctrl_layout.addWidget(self.btn_play)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.media_player.positionChanged.connect(self.slider.setValue)
+        self.media_player.durationChanged.connect(self.slider.setMaximum)
+        self.slider.sliderMoved.connect(self.media_player.setPosition)
+        ctrl_layout.addWidget(self.slider)
+        right_layout.addLayout(ctrl_layout)
+
+        # Cắt ghép & Xuất video
+        export_box = QGroupBox("🎬 Timeline & Xuất Bản Video")
+        exp_layout = QVBoxLayout(export_box)
+
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel("Bắt đầu (s):"))
+        self.start_input = QLineEdit("0")
+        time_layout.addWidget(self.start_input)
+
+        time_layout.addWidget(QLabel("Thời lượng (s):"))
+        self.dur_input = QLineEdit("")
+        self.dur_input.setPlaceholderText("Để trống lấy hết")
+        time_layout.addWidget(self.dur_input)
+        exp_layout.addLayout(time_layout)
+
+        btn_export = QPushButton("🚀 XUẤT VIDEO HOÀN CHỈNH (EXPORT STUDIO)")
+        btn_export.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; font-size: 15px; padding: 10px;")
+        btn_export.clicked.connect(self.export_video)
+        exp_layout.addWidget(btn_export)
+
+        right_layout.addWidget(export_box)
+
+        self.status_label = QLabel("Trạng thái: Sẵn sàng sáng tạo video cùng CATCAT Pro!")
+        right_layout.addWidget(self.status_label)
+
+        splitter.addWidget(right_panel)
+        splitter.setSizes([500, 800])
+
+    # ---------------------------------------------------------------------------
+    # Logic Xử Lý Tính Năng Chuyên Sâu
+    # ---------------------------------------------------------------------------
+
+    def browse_media(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Chọn Media", "", "Media Files (*.mp4 *.mkv *.avi *.mp3 *.wav)")
+        if f:
+            self.load_media(f)
+
+    def load_media(self, path):
+        if path.endswith(('.mp4', '.mkv', '.avi')):
+            self.current_video_path = path
+            self.media_player.setSource(QUrl.fromLocalFile(path))
+            self.status_label.setText(f"Đã nạp video: {os.path.basename(path)}")
+        elif path.endswith(('.mp3', '.wav')):
+            self.current_audio_path = path
+            self.status_label.setText(f"Đã nạp nhạc nền/audio: {os.path.basename(path)}")
+
+        items = [self.media_list.item(i).text() for i in range(self.media_list.count())]
+        if path not in items:
+            self.media_list.addItem(path)
+
+    def select_media(self, item):
+        self.load_media(item.text())
+
+    def download_video(self):
+        url = self.url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng nhập URL hợp lệ!")
+            return
+        self.status_label.setText("Đang tải video từ Internet...")
+        self.dl_thread = DownloadThread(url)
+        self.dl_thread.finished.connect(self.on_download_done)
+        self.dl_thread.error.connect(self.show_error)
+        self.dl_thread.start()
+
+    def on_download_done(self, path):
+        self.status_label.setText("Tải video thành công!")
+        self.load_media(path)
+
+    def generate_ai_voice(self):
+        text = self.ai_text.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng nhập kịch bản review!")
+            return
+        lang = self.ai_lang_combo.currentText().split("(")[-1].replace(")", "").strip()
+        style = self.voice_style_combo.currentText()
+
+        self.status_label.setText("Đang tổng hợp giọng đọc AI Review...")
+        self.ai_thread = AIReviewVoiceThread(text, lang, style)
+        self.ai_thread.finished.connect(self.on_ai_voice_done)
+        self.ai_thread.error.connect(self.show_error)
+        self.ai_thread.start()
+
+    def on_ai_voice_done(self, audio_path):
+        self.current_audio_path = audio_path
+        self.load_media(audio_path)
+        self.status_label.setText("Đã tạo giọng đọc AI thành công và nạp vào dự án!")
+        QMessageBox.information(self, "Thành công", "Đã tạo giọng đọc AI Review thành công! Bạn có thể xuất video để lồng tiếng.")
+
+    def translate_content(self):
+        text = self.trans_src.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(self, "Cảnh báo", "Vui lòng nhập văn bản cần dịch!")
+            return
+        dest = self.trans_dest_combo.currentText().split("(")[-1].replace(")", "").strip()
+        self.status_label.setText("Đang dịch tự động...")
+        self.trans_thread = TranslationThread(text, dest)
+        self.trans_thread.finished.connect(lambda res: self.trans_out.setPlainText(res))
+        self.trans_thread.error.connect(self.show_error)
+        self.trans_thread.start()
+
+    def toggle_play(self):
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+        else:
+            self.media_player.play()
+
+    def export_video(self):
+        if not self.current_video_path:
+            QMessageBox.warning(self, "Cảnh báo", "Chưa có video nguồn để xuất!")
+            return
+        out_path, _ = QFileDialog.getSaveFileName(self, "Lưu Video Xuất Bản", "catcat_pro_output.mp4", "MP4 Files (*.mp4)")
+        if not out_path:
+            return
+
+        start = self.start_input.text().strip()
+        dur = self.dur_input.text().strip()
+        speed = self.speed_combo.currentText()
+        filt = self.filter_combo.currentText()
+
+        self.status_label.setText("Đang render và xuất video qua FFmpeg...")
+        self.export_thread = FFmpegProcessThread(
+            self.current_video_path, self.current_audio_path, start, dur, speed, filt, out_path
+        )
+        self.export_thread.finished.connect(self.on_export_done)
+        self.export_thread.error.connect(self.show_error)
+        self.export_thread.start()
+
+    def on_export_done(self, path):
+        self.status_label.setText("Xuất video thành công hoàn hảo!")
+        QMessageBox.information(self, "Thành công", f"Video đã được lưu tại:\n{path}")
+
+    def show_error(self, err):
+        self.status_label.setText("Lỗi xử lý!")
+        QMessageBox.critical(self, "Lỗi Hệ Thống", f"Chi tiết lỗi:\n{err}")
+
+    def apply_pro_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', Arial; }
+            QTabWidget::pane { border: 1px solid #2d2d2d; }
+            QTabBar::tab { background: #1e1e1e; color: #888; padding: 10px 18px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+            QTabBar::tab:selected { background: #6a1b9a; color: white; font-weight: bold; }
+            QPushButton { background-color: #333333; color: white; border: none; padding: 8px 14px; border-radius: 6px; }
+            QPushButton:hover { background-color: #555555; }
+            QLineEdit, QTextEdit, QComboBox, QListWidget { background-color: #1a1a1a; color: #ffffff; border: 1px solid #333; border-radius: 6px; padding: 6px; }
+            QGroupBox { border: 1px solid #444; border-radius: 6px; margin-top: 12px; font-weight: bold; color: #b39ddb; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
+        """)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = CatCatProApp()
+    window.show()
+    sys.exit(app.exec())
