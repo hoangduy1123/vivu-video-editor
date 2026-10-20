@@ -1,0 +1,181 @@
+import os
+import requests
+from gtts import gTTS
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip
+import moviepy.video.fx.all as vfx
+
+# ==========================================
+# 1. LỚP XỬ LÝ ÂM THANH (LỒNG TIẾNG AI)
+# ==========================================
+class TTSEngine:
+    def generate_voiceover(self, text, lang="vi", output_path="output/voiceover.mp3"):
+        """Tạo file lồng tiếng AI từ văn bản kịch bản"""
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            tts = gTTS(text=text, lang=lang, slow=False)
+            tts.save(output_path)
+            print(f"🎙️ Tạo lồng tiếng thành công: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"❌ Lỗi khi tạo lồng tiếng TTS: {e}")
+            return None
+
+# ==========================================
+# 2. LỚP XỬ LÝ VIDEO (XÓA PHÔNG, RENDER 4K)
+# ==========================================
+class VideoEditor:
+    def __init__(self, resolution="4K"):
+        # Định nghĩa các độ phân giải chuẩn
+        self.resolutions = {
+            "4K": (3840, 2160),
+            "2K": (2560, 1440),
+            "1080p": (1920, 1080),
+            "720p": (1280, 720)
+        }
+        self.target_res = self.resolutions.get(resolution, (1920, 1080))
+
+    def apply_blur_background(self, video_path):
+        """Tạo hiệu ứng xóa phông / làm mờ nền cho video"""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Không tìm thấy file video gốc tại: {video_path}")
+            
+        clip = VideoFileClip(video_path)
+        
+        # Làm mờ nền và phóng to theo kích thước mục tiêu
+        bg_clip = clip.fx(vfx.gaussian_blur, 10).resize(self.target_res)
+        
+        # Đưa video gốc vào giữa (chiếm 80% chiều cao)
+        fg_clip = clip.resize(height=int(self.target_res[1] * 0.8))
+        
+        final_clip = CompositeVideoClip([
+            bg_clip.set_duration(clip.duration),
+            fg_clip.set_position("center")
+        ])
+        return final_clip
+
+    def render_final_video(self, video_clip, audio_path, output_path):
+        """Kết hợp audio + video và xuất file tối ưu bộ nhớ"""
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Không tìm thấy file âm thanh tại: {audio_path}")
+
+        audio = AudioFileClip(audio_path)
+        final_video = video_clip.set_audio(audio)
+        
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Cấu hình bitrate tối ưu dung lượng (4K dùng 12M, các độ phân giải khác dùng 4M)
+        bitrate_val = "12M" if self.target_res[0] >= 3840 else "4M"
+
+        try:
+            final_video.write_videofile(
+                output_path,
+                fps=30,
+                codec="libx264",
+                audio_codec="aac",
+                preset="fast",  # Tối ưu tốc độ render
+                bitrate=bitrate_val,
+                threads=4       # Đa luồng giúp chạy nhanh hơn
+            )
+            print(f"✅ Xuất video thành công: {output_path}")
+        except Exception as e:
+            print(f"❌ Lỗi trong quá trình render video: {e}")
+        finally:
+            # Giải phóng RAM tránh giật lag máy
+            video_clip.close()
+            audio.close()
+
+# ==========================================
+# 3. LỚP ĐĂNG BÀI LÊN MẠNG XÃ HỘI (FACEBOOK)
+# ==========================================
+class SocialPublisher:
+    def __init__(self, fb_page_token=None, fb_page_id=None):
+        self.fb_page_token = fb_page_token
+        self.fb_page_id = fb_page_id
+
+    def upload_to_facebook(self, video_path, title, description):
+        """Đăng video tự động lên Facebook Page"""
+        if not self.fb_page_token or not self.fb_page_id:
+            print("ℹ️ Chưa cấu hình Facebook Token/ID. Bỏ qua bước tự động đăng.")
+            return False
+
+        if not os.path.exists(video_path):
+            print("❌ File video không tồn tại để đăng.")
+            return False
+
+        url = f"https://graph-video.facebook.com/v17.0/{self.fb_page_id}/videos"
+        payload = {
+            'description': f"{title}\n\n{description}",
+            'access_token': self.fb_page_token
+        }
+        
+        try:
+            with open(video_path, 'rb') as video_file:
+                files = {'source': video_file}
+                response = requests.post(url, data=payload, files=files, timeout=120)
+                
+            if response.status_code == 200:
+                print("🚀 Đăng video lên Facebook thành công!")
+                return True
+            else:
+                print(f"❌ Lỗi Facebook API: {response.text}")
+                return False
+        except Exception as e:
+            print(f"❌ Lỗi kết nối khi đăng Facebook: {e}")
+            return False
+
+# ==========================================
+# 4. HÀM ĐIỀU PHỐI CHÍNH (AUTOMATIC PIPELINE)
+# ==========================================
+def run_autoreview(movie_data):
+    print("\n🎬 === BẮT ĐẦU HỆ THỐNG AUTOREVIEW ===\n")
+    
+    title = movie_data.get("title", "Review Phim Hay")
+    script = movie_data.get("script", "Nội dung review phim...")
+    raw_video = movie_data.get("raw_video", "input/sample.mp4")
+    resolution = movie_data.get("resolution", "4K")
+    language = movie_data.get("language", "vi")
+    
+    # 1. Kiểm tra đầu vào
+    if not os.path.exists(raw_video):
+        print(f"⚠️ Chưa có video đầu vào tại '{raw_video}'. Hãy đặt file mp4 vào thư mục 'input/' trước khi chạy!")
+        return
+
+    # 2. Tạo lồng tiếng AI
+    tts = TTSEngine()
+    audio_path = tts.generate_voiceover(script, lang=language)
+    if not audio_path:
+        return
+
+    # 3. Xử lý video (Làm mờ/xóa phông nền, cấu hình 4K)
+    editor = VideoEditor(resolution=resolution)
+    try:
+        processed_clip = editor.apply_blur_background(raw_video)
+        
+        # 4. Render xuất video hoàn chỉnh
+        output_filename = f"output/{title.replace(' ', '_')}_review.mp4"
+        editor.render_final_video(processed_clip, audio_path, output_filename)
+        
+        # 5. Tự động đăng Facebook (nếu đã cấu hình token)
+        publisher = SocialPublisher()
+        publisher.upload_to_facebook(output_filename, title, script[:200] + "...")
+        
+    except Exception as e:
+        print(f"❌ Đã xảy ra lỗi hệ thống: {e}")
+    
+    print("\n✨ === HOÀN TẤT QUÁ TRÌNH AUTOREVIEW ===\n")
+
+# ==========================================
+# 5. CHẠY THỬ NGHIỆM (MAIN ENTRY)
+# ==========================================
+if __name__ == "__main__":
+    # Dữ liệu kịch bản mẫu
+    sample_data = {
+        "title": "Review Phim Hanh Dong Siêu Phẩm",
+        "script": "Chào mừng bạn đến với kênh AutoReview Phim! Hôm nay chúng ta sẽ cùng khám phá siêu phẩm hành động kịch tính này.",
+        "raw_video": "input/sample.mp4",  # Đặt video gốc của bạn ở đây
+        "resolution": "4K",               # Hỗ trợ: "4K", "2K", "1080p", "720p"
+        "language": "vi"
+    }
+    
+    # Chạy chương trình
+    run_autoreview(sample_data)
